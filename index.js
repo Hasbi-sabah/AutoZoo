@@ -7,9 +7,7 @@ const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 const cooldownRegex = /you can rescue another animal in \*\*(.*?)\*\*/i;
 
 // Mutable interval
-let intervalMinutes = 320;
-let timer = null;
-let nextTrigger = null;
+let intervalMinutes = 340;
 let activeCooldownTimer = null;
 let nextRescueTime = null;
 
@@ -34,12 +32,6 @@ async function sendChannelMessage() {
   } catch (err) {
     console.error('Failed to send message:', err.message);
   }
-}
-
-function scheduleNext(channel) {
-  clearTimeout(timer);
-  nextTrigger = Date.now() + intervalMinutes * 60 * 1000;
-  timer = setTimeout(() => sendChannelMessage(), intervalMinutes * 60 * 1000);
 }
 
 function parseCooldown(cooldownStr) {
@@ -141,5 +133,17 @@ client.on('interactionCreate', async interaction => {
     );
   }
 });
+
+const express = require('express')
+const app = express()
+const port = process.env.PORT || 4000
+
+app.get('/', (req, res) => {
+  res.send('Hello World!', nextRescueTime)
+})
+
+app.listen(port, () => {
+  console.log(`Example app listening on port ${port}`)
+})
 
 client.login(TOKEN);
