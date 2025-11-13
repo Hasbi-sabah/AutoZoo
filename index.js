@@ -2,13 +2,12 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID; // your bot's client ID
-const GUILD_ID = process.env.GUILD_ID;   // for testing (guild commands propagate instantly)
+const CLIENT_ID = process.env.CLIENT_ID;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 const cooldownRegex = /you can rescue another animal in \*\*(.*?)\*\*/i;
 
 // Mutable interval
-let intervalMinutes = 20;
+let intervalMinutes = 320;
 let timer = null;
 let nextTrigger = null;
 let activeCooldownTimer = null;
@@ -30,9 +29,8 @@ async function sendChannelMessage() {
   try {
     const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
     if (!channel || !channel.isTextBased()) return;
-    await channel.send('heloooo');
+    await channel.send('BOT DEPLOYED AND LISTENING');
     console.log(new Date().toISOString(), 'Message sent.');
-    scheduleNext(channel);
   } catch (err) {
     console.error('Failed to send message:', err.message);
   }
@@ -59,10 +57,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName('timer')
     .setDescription('Show the remaining time until your next rescue.'),
-  new SlashCommandBuilder()
-    .setName('setinterval')
-    .setDescription('Set the message interval in minutes.')
-    .addIntegerOption(option => option.setName('minutes').setDescription('Interval in minutes').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -101,9 +95,27 @@ client.on('messageCreate', async (msg) => {
       msg.channel.send('⏰ Your rescue is ready!');
       activeCooldownTimer = null;
       nextRescueTime = null;
+      nextRescueTime = Date.now() + intervalMinutes * 60 * 1000;
     }, cooldownMs);
 
     console.log(`Cooldown timer set for ${cooldownMs / 1000}s`);
+  }
+
+  const content = msg.content.trim().toLowerCase();
+  if (content === '!timer') {
+    if (!nextRescueTime) {
+      msg.channel.send('No active rescue timer.');
+      return;
+    }
+    const remainingMs = nextRescueTime - Date.now();
+    if (remainingMs <= 0) {
+      msg.channel.send('Rescue is ready now!');
+      return;
+    }
+    const hrs = Math.floor(remainingMs / 3600000);
+    const mins = Math.floor((remainingMs % 3600000) / 60000);
+    const secs = Math.floor((remainingMs % 60000) / 1000);
+    msg.channel.send(`Next rescue in ${hrs > 0 ? hrs + 'h ' : ''}${mins > 0 ? mins + 'm ' : ''}${secs}s`);
   }
 });
 
@@ -127,14 +139,6 @@ client.on('interactionCreate', async interaction => {
     await interaction.reply(
       `Next rescue in ${hrs > 0 ? hrs + 'h ' : ''}${mins > 0 ? mins + 'm ' : ''}${secs}s`
     );
-  }
-
-  if (interaction.commandName === 'setinterval') {
-    const minutes = interaction.options.getInteger('minutes');
-    intervalMinutes = minutes;
-    const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
-    scheduleNext(channel);
-    await interaction.reply(`Interval updated to ${minutes} minutes.`);
   }
 });
 
