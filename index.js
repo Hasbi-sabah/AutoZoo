@@ -1,12 +1,54 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, Partials, MessageFlags } = require('discord.js');
+const Redis = require('ioredis');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+// ----------------- Logging Setup -----------------
+const LOG_DIR = path.join(__dirname, 'logs');
+if (!fs.existsSync(LOG_DIR)) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+const logFile = path.join(LOG_DIR, `bot-${new Date().toISOString().split('T')[0]}.log`);
+const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+
+function log(level, ...args) {
+  const timestamp = new Date().toISOString();
+  const message = `[${timestamp}] [${level}] ${args.join(' ')}`;
+  console.log(message);
+  logStream.write(message + '\n');
+}
+
+const logger = {
+  info: (...args) => log('INFO', ...args),
+  warn: (...args) => log('WARN', ...args),
+  error: (...args) => log('ERROR', ...args),
+  debug: (...args) => process.env.NODE_ENV === 'development' && log('DEBUG', ...args),
+};
+
+// ----------------- Redis Setup -----------------
+const redis = new Redis(REDIS_URL, {
+  retryStrategy(times) {
+    const delay = Math.min(times * 50, 2000);
+    logger.warn(`Redis connection retry attempt ${times}, waiting ${delay}ms`);
+    return delay;
+  },
+  maxRetriesPerRequest: 3,
+});
+
+redis.on('error', (err) => logger.error('Redis error:', err));
+redis.on('connect', () => logger.info('Redis connected'));
 
 // ----------------- Constants -----------------
 const CARD_PULL_DEFAULT_HOURS = 11.5;
-const RESCUE_DEFAULT_HOURS = 6;
+const TIMER_CHECK_INTERVAL = 10000; // Check every 10 seconds
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_DELAY = 5000; // 5 seconds between retries
 
 const REGEX = {
   cooldown: /(?:you can rescue another animal in \*\*(.*?)\*\*|\(finishes in\s*([0-9:]+)\))/i,
@@ -24,19 +66,82 @@ const MESSAGES = {
   noTimersSet: '💡 **Tip:** Run `/rescue`, `/terminal command:pul`, or `/terminal command:todo` to start tracking your timers!',
 };
 
-// ----------------- State Management -----------------
-const channelTimers = new Map();
+// ----------------- Redis Helper Functions -----------------
+async function setTimerInRedis(channelId, timerType, targetTime) {
+  const key = `timer:${channelId}:${timerType}`;
+  const timerData = {
+    targetTime: targetTime,
+    setAt: Date.now(),
+    channelId: channelId,
+    timerType: timerType
+  };
+  
+  // Store as JSON for full context
+  await redis.set(key, JSON.stringify(timerData));
+  
+  // Use targetTime as score in sorted set for efficient range queries
+  await redis.zadd('timers:queue', targetTime, `${channelId}:${timerType}`);
+  
+  const timeUntil = formatRemaining(targetTime - Date.now());
+  logger.info(`Set ${timerType} timer for channel ${channelId} - fires at ${new Date(targetTime).toISOString()} (in ${timeUntil})`);
+}
 
-function getChannelTimers(channelId) {
-  if (!channelTimers.has(channelId)) {
-    channelTimers.set(channelId, {
-      rescueTimer: null,
-      nextRescueTime: null,
-      cardPullTimer: null,
-      nextCardPullTime: null,
-    });
+async function getTimerFromRedis(channelId, timerType) {
+  const key = `timer:${channelId}:${timerType}`;
+  const value = await redis.get(key);
+  
+  if (!value) return null;
+  
+  try {
+    const data = JSON.parse(value);
+    return data.targetTime;
+  } catch (err) {
+    // Fallback for old format (plain timestamp)
+    return parseInt(value);
   }
-  return channelTimers.get(channelId);
+}
+
+async function getTimerDataFromRedis(channelId, timerType) {
+  const key = `timer:${channelId}:${timerType}`;
+  const value = await redis.get(key);
+  
+  if (!value) return null;
+  
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    // Fallback for old format
+    return {
+      targetTime: parseInt(value),
+      setAt: null,
+      channelId,
+      timerType
+    };
+  }
+}
+
+async function clearTimerFromRedis(channelId, timerType) {
+  const key = `timer:${channelId}:${timerType}`;
+  await redis.del(key);
+  await redis.zrem('timers:queue', `${channelId}:${timerType}`);
+  logger.info(`Cleared ${timerType} timer for channel ${channelId}`);
+}
+
+async function getRetryCount(channelId, timerType) {
+  const key = `retry:${channelId}:${timerType}`;
+  const count = await redis.get(key);
+  return count ? parseInt(count) : 0;
+}
+
+async function incrementRetryCount(channelId, timerType) {
+  const key = `retry:${channelId}:${timerType}`;
+  await redis.incr(key);
+  await redis.expire(key, 3600); // Expire after 1 hour
+}
+
+async function clearRetryCount(channelId, timerType) {
+  const key = `retry:${channelId}:${timerType}`;
+  await redis.del(key);
 }
 
 // ----------------- Utility Functions -----------------
@@ -79,7 +184,6 @@ function parseHumanDuration(text) {
     else if (/^s/.test(unit)) ms += Math.round(val * 1000);
   }
 
-  // Fallback: treat plain numbers as minutes
   if (ms === 0) {
     const n = parseFloat(text);
     if (!Number.isNaN(n)) ms = Math.round(n * 60 * 1000);
@@ -94,58 +198,134 @@ function absoluteFromParts(timeStr, ts) {
   return Date.now() + parseCooldown(timeStr);
 }
 
-function formatTimerStatus(nextTime, includeHint = false) {
-  if (!nextTime) {
-    return includeHint ? 'No active timer' : 'No active timer';
-  }
-
+function formatTimerStatus(nextTime) {
+  if (!nextTime) return 'No active timer';
   const remaining = nextTime - Date.now();
   return remaining <= 0 ? 'Ready now!' : formatRemaining(remaining);
 }
 
 // ----------------- Timer Management -----------------
-function setTimer(channelId, timerType, targetTime, channel, notify = false) {
-  const timers = getChannelTimers(channelId);
+async function setTimer(channelId, timerType, targetTime, channel, notify = false) {
   const isRescue = timerType === 'rescue';
-  const timerKey = isRescue ? 'rescueTimer' : 'cardPullTimer';
-  const timeKey = isRescue ? 'nextRescueTime' : 'nextCardPullTime';
   const readyMsg = isRescue ? MESSAGES.rescueReady : MESSAGES.cardPullReady;
   const setMsg = isRescue ? MESSAGES.rescueSet : MESSAGES.cardPullSet;
 
-  // Clear existing timer
-  if (timers[timerKey]) {
-    clearTimeout(timers[timerKey]);
-    timers[timerKey] = null;
-  }
-
-  timers[timeKey] = targetTime;
+  await setTimerInRedis(channelId, timerType, targetTime);
+  
   const delay = targetTime - Date.now();
 
   if (delay <= 0) {
-    channel.send(readyMsg);
-    timers[timeKey] = null;
+    await sendMessage(channel, readyMsg, channelId, timerType);
+    await clearTimerFromRedis(channelId, timerType);
     return;
   }
 
-  timers[timerKey] = setTimeout(() => {
-    channel.send(readyMsg);
-    timers[timerKey] = null;
-    timers[timeKey] = null;
-  }, delay);
-
-  console.log(new Date().toISOString(), `${timerType} reminder for channel ${channelId} scheduled in ${Math.round(delay / 1000)}s`);
-
   if (notify) {
-    channel.send(setMsg(formatRemaining(delay)));
+    await sendMessage(channel, setMsg(formatRemaining(delay)), channelId, timerType);
   }
 }
 
-function setRescueTimer(channelId, rescueTimeMs, channel, notify = false) {
-  setTimer(channelId, 'rescue', rescueTimeMs, channel, notify);
+async function sendMessage(channel, message, channelId, timerType) {
+  try {
+    await channel.send(message);
+    await clearRetryCount(channelId, timerType);
+    logger.info(`Sent message to channel ${channelId}: ${message}`);
+    return true;
+  } catch (err) {
+    logger.error(`Failed to send message to channel ${channelId}:`, err.message);
+    const retryCount = await getRetryCount(channelId, timerType);
+    
+    if (retryCount < MAX_RETRY_ATTEMPTS) {
+      await incrementRetryCount(channelId, timerType);
+      logger.warn(`Queuing retry ${retryCount + 1}/${MAX_RETRY_ATTEMPTS} for channel ${channelId}`);
+      
+      // Schedule retry
+      setTimeout(async () => {
+        await sendMessage(channel, message, channelId, timerType);
+      }, RETRY_DELAY);
+    } else {
+      logger.error(`Max retries reached for channel ${channelId}, clearing timer`);
+      await clearTimerFromRedis(channelId, timerType);
+      await clearRetryCount(channelId, timerType);
+    }
+    return false;
+  }
 }
 
-function setCardPullTimer(channelId, pullTimeMs, channel, notify = false) {
-  setTimer(channelId, 'cardPull', pullTimeMs, channel, notify);
+async function setRescueTimer(channelId, rescueTimeMs, channel, notify = false) {
+  await setTimer(channelId, 'rescue', rescueTimeMs, channel, notify);
+}
+
+async function setCardPullTimer(channelId, pullTimeMs, channel, notify = false) {
+  await setTimer(channelId, 'cardPull', pullTimeMs, channel, notify);
+}
+
+// ----------------- Timer Checker -----------------
+async function checkTimers() {
+  try {
+    const now = Date.now();
+    
+    // Get all timers that should have fired by now (score <= now)
+    const dueTimers = await redis.zrangebyscore('timers:queue', 0, now);
+
+    if (dueTimers.length > 0) {
+      logger.info(`Found ${dueTimers.length} due timer(s) to process`);
+    }
+
+    for (const timerKey of dueTimers) {
+      const [channelId, timerType] = timerKey.split(':');
+      const timerData = await getTimerDataFromRedis(channelId, timerType);
+      
+      if (!timerData || !timerData.targetTime) {
+        logger.warn(`Timer data missing for ${timerKey}, cleaning up`);
+        await clearTimerFromRedis(channelId, timerType);
+        continue;
+      }
+
+      const { targetTime, setAt } = timerData;
+      
+      // Double-check the timestamp (belt and suspenders approach)
+      if (targetTime > now) {
+        logger.warn(`Timer ${timerKey} not yet due (target: ${new Date(targetTime).toISOString()}), skipping`);
+        continue;
+      }
+
+      const delay = now - targetTime;
+      const delayStr = formatRemaining(delay);
+      
+      if (delay > 60000) { // More than 1 minute late
+        logger.warn(`Timer ${timerKey} is ${delayStr} overdue (was set to fire at ${new Date(targetTime).toISOString()})`);
+      } else {
+        logger.info(`Processing timer ${timerKey} (on time)`);
+      }
+
+      try {
+        const channel = await client.channels.fetch(channelId);
+        const message = timerType === 'rescue' ? MESSAGES.rescueReady : MESSAGES.cardPullReady;
+        
+        const sent = await sendMessage(channel, message, channelId, timerType);
+        if (sent) {
+          await clearTimerFromRedis(channelId, timerType);
+        }
+      } catch (err) {
+        logger.error(`Error processing timer for channel ${channelId}:`, err.message);
+        
+        // If channel doesn't exist anymore, clean up
+        if (err.code === 10003 || err.message.includes('Unknown Channel')) {
+          logger.warn(`Channel ${channelId} no longer exists, cleaning up timer`);
+          await clearTimerFromRedis(channelId, timerType);
+        }
+      }
+    }
+  } catch (err) {
+    logger.error('Error checking timers:', err);
+  }
+}
+
+// Check for missed timers on startup
+async function checkMissedTimers() {
+  logger.info('Checking for missed timers from downtime...');
+  await checkTimers();
 }
 
 // ----------------- Message Handlers -----------------
@@ -210,14 +390,15 @@ function handleNextRescueMessage(msg, channelId) {
   return false;
 }
 
-function handleTimerCommand(msg, channelId) {
+async function handleTimerCommand(msg, channelId) {
   if (msg.content.trim().toLowerCase() === '!timer') {
-    const timers = getChannelTimers(channelId);
-    const hasNoTimers = !timers.nextRescueTime && !timers.nextCardPullTime;
+    const rescueTime = await getTimerFromRedis(channelId, 'rescue');
+    const cardPullTime = await getTimerFromRedis(channelId, 'cardPull');
+    const hasNoTimers = !rescueTime && !cardPullTime;
 
     const response = [
-      `🐾 Next Rescue: ${formatTimerStatus(timers.nextRescueTime)}`,
-      `🎴 Next Card Pull: ${formatTimerStatus(timers.nextCardPullTime)}`,
+      `🐾 Next Rescue: ${formatTimerStatus(rescueTime)}`,
+      `🎴 Next Card Pull: ${formatTimerStatus(cardPullTime)}`,
       hasNoTimers ? `\n${MESSAGES.noTimersSet}` : '',
     ].filter(Boolean).join('\n');
 
@@ -249,37 +430,42 @@ const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 (async () => {
   try {
-    console.log('Deploying slash commands...');
+    logger.info('Deploying slash commands...');
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log('Slash commands deployed!');
+    logger.info('Slash commands deployed!');
   } catch (err) {
-    console.error('Error deploying commands:', err);
+    logger.error('Error deploying commands:', err);
   }
 })();
 
 // ----------------- Event Listeners -----------------
 client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  console.log('Bot is ready to receive DMs!');
+  logger.info(`Logged in as ${client.user.tag}`);
+  logger.info('Bot is ready to receive DMs!');
+  
+  // Check for any timers that should have fired while bot was down
+  checkMissedTimers();
+  
+  // Start timer checker
+  setInterval(checkTimers, TIMER_CHECK_INTERVAL);
+  logger.info(`Timer checker started (interval: ${TIMER_CHECK_INTERVAL}ms)`);
 });
 
 client.on('messageCreate', async (msg) => {
   if (msg.author.id === client.user.id) return;
 
   const channelId = msg.channel.id;
-
-  console.log(`[${new Date().toISOString()}] Message from ${msg.author.tag} in channel ${channelId}`);
+  logger.debug(`Message from ${msg.author.tag} in channel ${channelId}`);
 
   try {
-    // Process message through handlers
     handleManualCardPullReset(msg, channelId) ||
       handlePullWaitMessage(msg, channelId) ||
       handleCooldownMessage(msg, channelId) ||
       (handleCardPullMessage(msg, channelId) &&
-        handleNextRescueMessage(msg, channelId)) ||
-      handleTimerCommand(msg, channelId);
+      handleNextRescueMessage(msg, channelId)) ||
+      await handleTimerCommand(msg, channelId);
   } catch (err) {
-    console.error('Error handling message:', err);
+    logger.error('Error handling message:', err);
   }
 });
 
@@ -296,12 +482,13 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const channelId = interaction.channel.id;
-    const timers = getChannelTimers(channelId);
-    const hasNoTimers = !timers.nextRescueTime && !timers.nextCardPullTime;
+    const rescueTime = await getTimerFromRedis(channelId, 'rescue');
+    const cardPullTime = await getTimerFromRedis(channelId, 'cardPull');
+    const hasNoTimers = !rescueTime && !cardPullTime;
 
     const response = [
-      `🐾 Next Rescue: ${formatTimerStatus(timers.nextRescueTime)}`,
-      `🎴 Next Card Pull: ${formatTimerStatus(timers.nextCardPullTime)}`,
+      `🐾 Next Rescue: ${formatTimerStatus(rescueTime)}`,
+      `🎴 Next Card Pull: ${formatTimerStatus(cardPullTime)}`,
       hasNoTimers ? `\n${MESSAGES.noTimersSet}` : '',
     ].filter(Boolean).join('\n');
 
@@ -310,3 +497,20 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(TOKEN);
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  logger.info('Shutting down gracefully...');
+  await redis.quit();
+  logStream.end();
+  client.destroy();
+  process.exit(0);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  logger.error('Unhandled rejection:', err);
+});
