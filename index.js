@@ -46,6 +46,7 @@ redis.on('connect', () => logger.info('Redis connected'));
 
 // ----------------- Constants -----------------
 const CARD_PULL_DEFAULT_HOURS = 11.5;
+const RESCUE_DEFAULT_HOURS = 6;
 const TIMER_CHECK_INTERVAL = 10000; // Check every 10 seconds
 const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_DELAY = 5000; // 5 seconds between retries
@@ -75,13 +76,13 @@ async function setTimerInRedis(channelId, timerType, targetTime) {
     channelId: channelId,
     timerType: timerType
   };
-  
+
   // Store as JSON for full context
   await redis.set(key, JSON.stringify(timerData));
-  
+
   // Use targetTime as score in sorted set for efficient range queries
   await redis.zadd('timers:queue', targetTime, `${channelId}:${timerType}`);
-  
+
   const timeUntil = formatRemaining(targetTime - Date.now());
   logger.info(`Set ${timerType} timer for channel ${channelId} - fires at ${new Date(targetTime).toISOString()} (in ${timeUntil})`);
 }
@@ -89,9 +90,9 @@ async function setTimerInRedis(channelId, timerType, targetTime) {
 async function getTimerFromRedis(channelId, timerType) {
   const key = `timer:${channelId}:${timerType}`;
   const value = await redis.get(key);
-  
+
   if (!value) return null;
-  
+
   try {
     const data = JSON.parse(value);
     return data.targetTime;
@@ -104,9 +105,9 @@ async function getTimerFromRedis(channelId, timerType) {
 async function getTimerDataFromRedis(channelId, timerType) {
   const key = `timer:${channelId}:${timerType}`;
   const value = await redis.get(key);
-  
+
   if (!value) return null;
-  
+
   try {
     return JSON.parse(value);
   } catch (err) {
@@ -211,7 +212,7 @@ async function setTimer(channelId, timerType, targetTime, channel, notify = fals
   const setMsg = isRescue ? MESSAGES.rescueSet : MESSAGES.cardPullSet;
 
   await setTimerInRedis(channelId, timerType, targetTime);
-  
+
   const delay = targetTime - Date.now();
 
   if (delay <= 0) {
@@ -234,11 +235,11 @@ async function sendMessage(channel, message, channelId, timerType) {
   } catch (err) {
     logger.error(`Failed to send message to channel ${channelId}:`, err.message);
     const retryCount = await getRetryCount(channelId, timerType);
-    
+
     if (retryCount < MAX_RETRY_ATTEMPTS) {
       await incrementRetryCount(channelId, timerType);
       logger.warn(`Queuing retry ${retryCount + 1}/${MAX_RETRY_ATTEMPTS} for channel ${channelId}`);
-      
+
       // Schedule retry
       setTimeout(async () => {
         await sendMessage(channel, message, channelId, timerType);
@@ -264,7 +265,7 @@ async function setCardPullTimer(channelId, pullTimeMs, channel, notify = false) 
 async function checkTimers() {
   try {
     const now = Date.now();
-    
+
     // Get all timers that should have fired by now (score <= now)
     const dueTimers = await redis.zrangebyscore('timers:queue', 0, now);
 
@@ -275,7 +276,7 @@ async function checkTimers() {
     for (const timerKey of dueTimers) {
       const [channelId, timerType] = timerKey.split(':');
       const timerData = await getTimerDataFromRedis(channelId, timerType);
-      
+
       if (!timerData || !timerData.targetTime) {
         logger.warn(`Timer data missing for ${timerKey}, cleaning up`);
         await clearTimerFromRedis(channelId, timerType);
@@ -283,7 +284,7 @@ async function checkTimers() {
       }
 
       const { targetTime, setAt } = timerData;
-      
+
       // Double-check the timestamp (belt and suspenders approach)
       if (targetTime > now) {
         logger.warn(`Timer ${timerKey} not yet due (target: ${new Date(targetTime).toISOString()}), skipping`);
@@ -292,7 +293,7 @@ async function checkTimers() {
 
       const delay = now - targetTime;
       const delayStr = formatRemaining(delay);
-      
+
       if (delay > 60000) { // More than 1 minute late
         logger.warn(`Timer ${timerKey} is ${delayStr} overdue (was set to fire at ${new Date(targetTime).toISOString()})`);
       } else {
@@ -302,14 +303,14 @@ async function checkTimers() {
       try {
         const channel = await client.channels.fetch(channelId);
         const message = timerType === 'rescue' ? MESSAGES.rescueReady : MESSAGES.cardPullReady;
-        
+
         const sent = await sendMessage(channel, message, channelId, timerType);
         if (sent) {
           await clearTimerFromRedis(channelId, timerType);
         }
       } catch (err) {
         logger.error(`Error processing timer for channel ${channelId}:`, err.message);
-        
+
         // If channel doesn't exist anymore, clean up
         if (err.code === 10003 || err.message.includes('Unknown Channel')) {
           logger.warn(`Channel ${channelId} no longer exists, cleaning up timer`);
@@ -408,6 +409,24 @@ async function handleTimerCommand(msg, channelId) {
   return false;
 }
 
+async function checkAndSetDefaultRescueTimer(channelId, channel) {
+  try {
+    const existingRescueTime = await getTimerFromRedis(channelId, 'rescue');
+
+    if (!existingRescueTime) {
+      const defaultRescueTime = Date.now() + (RESCUE_DEFAULT_HOURS * 60 * 60 * 1000);
+      await setRescueTimer(channelId, defaultRescueTime, channel, false);
+      logger.info(`Set default 6-hour rescue timer for channel ${channelId}`);
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    logger.error('Error checking/setting default rescue timer:', err);
+    return false;
+  }
+}
+
 // ----------------- Bot Client -----------------
 const client = new Client({
   intents: [
@@ -442,10 +461,10 @@ const rest = new REST({ version: '10' }).setToken(TOKEN);
 client.once('clientReady', () => {
   logger.info(`Logged in as ${client.user.tag}`);
   logger.info('Bot is ready to receive DMs!');
-  
+
   // Check for any timers that should have fired while bot was down
   checkMissedTimers();
-  
+
   // Start timer checker
   setInterval(checkTimers, TIMER_CHECK_INTERVAL);
   logger.info(`Timer checker started (interval: ${TIMER_CHECK_INTERVAL}ms)`);
@@ -462,8 +481,9 @@ client.on('messageCreate', async (msg) => {
       handlePullWaitMessage(msg, channelId) ||
       handleCooldownMessage(msg, channelId) ||
       (handleCardPullMessage(msg, channelId) &&
-      handleNextRescueMessage(msg, channelId)) ||
-      await handleTimerCommand(msg, channelId);
+        handleNextRescueMessage(msg, channelId)) ||
+      await handleTimerCommand(msg, channelId) ||
+      await checkAndSetDefaultRescueTimer(channelId, msg.channel);
   } catch (err) {
     logger.error('Error handling message:', err);
   }
